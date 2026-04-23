@@ -5,6 +5,7 @@ from __future__ import annotations
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
@@ -68,19 +69,23 @@ class WeiyuSwitch(SwitchEntity):
         """Expose model and key metrics on switch entity."""
         data = self._client.get_device_data(self._devno)
         raw = data.get("raw", {})
-        return {
+        wmode = int(raw.get("wmode", 0) or 0)
+        attrs = {
             "设备编号": self._devno,
             "型号": data.get("model", "未知型号"),
             "设备分类": data.get("meta", {}).get("category"),
             "固件版本": data.get("meta", {}).get("version"),
+            "远程控制": "已锁定（手动模式）" if wmode == 1 else "可用",
             "电压(V)": _scale(raw.get("voltage"), 100),
             "电流(A)": _scale(raw.get("electric"), 1000),
             "有功功率(W)": _scale(raw.get("powerrate"), 100),
             "电能(kWh)": _scale(raw.get("power"), 100),
             "频率(Hz)": _scale(raw.get("frequency"), 100),
             "功率因数": _scale(raw.get("powerfactor"), 1000),
-            "漏电流(mA)": _scale(raw.get("leakagecurrent"), 100),
         }
+        if self._client.is_leakage_protection_device(self._devno):
+            attrs["漏电流(mA)"] = _scale(raw.get("leakagecurrent"), 100)
+        return attrs
 
     @property
     def device_info(self) -> dict:
@@ -97,10 +102,16 @@ class WeiyuSwitch(SwitchEntity):
 
     async def async_turn_on(self, **kwargs) -> None:
         """Turn switch on."""
+        raw = self._client.get_device_data(self._devno).get("raw", {})
+        if int(raw.get("wmode", 0) or 0) == 1:
+            raise HomeAssistantError("设备当前处于手动模式，已禁止远程合闸")
         await self._client.async_set_device_state(self._devno, True)
 
     async def async_turn_off(self, **kwargs) -> None:
         """Turn switch off."""
+        raw = self._client.get_device_data(self._devno).get("raw", {})
+        if int(raw.get("wmode", 0) or 0) == 1:
+            raise HomeAssistantError("设备当前处于手动模式，已禁止远程分闸")
         await self._client.async_set_device_state(self._devno, False)
 
 

@@ -57,8 +57,8 @@ class WeiyuGatewayClient:
         }
         self._alarm_cache: dict[str, bool] = {}
         self._device_settings_cache: dict[str, dict[str, dict]] = {}
-        self._last_report_monotonic: float = monotonic()
         self._target_report_cycle_seconds: int = 20
+        self._fast_poll_until_monotonic: float = 0.0
         self._request_results: deque[tuple[float, bool]] = deque(maxlen=1024)
         self._pending_subdev_requests: deque[float] = deque(maxlen=256)
         self._last_heartbeat_monotonic: float | None = None
@@ -351,6 +351,7 @@ class WeiyuGatewayClient:
         self._notify_listeners(set())
         await self._async_send_packet({"actionType": "report", "actionTarget": "subver"})
         await self.async_request_subdevices()
+        self._fast_poll_until_monotonic = monotonic() + 60
         if self._settings_refresh_task and not self._settings_refresh_task.done():
             self._settings_refresh_task.cancel()
         self._settings_refresh_task = self.hass.async_create_task(self._delayed_refresh_all_settings())
@@ -412,7 +413,6 @@ class WeiyuGatewayClient:
 
     async def _handle_payload(self, payload: dict) -> None:
         """Handle decoded protocol payload."""
-        self._last_report_monotonic = monotonic()
         heartbeat_key = "Heartbeat" if "Heartbeat" in payload else "heatbeat" if "heatbeat" in payload else None
         heartbeat = payload.get(heartbeat_key) if heartbeat_key else None
         if heartbeat and heartbeat_key:
@@ -450,45 +450,53 @@ class WeiyuGatewayClient:
 
         self._resolve_pending_subdev_request(True)
 
-        value = data.get("Value", {})
-        base_class = value.get("class")
-        child_items = value.get("child") or []
-        if isinstance(child_items, dict):
-            child_items = [child_items]
-        if not isinstance(child_items, list):
-            return
-
         changed: set[str] = set()
-        for child in child_items:
-            if not isinstance(child, dict):
+        value_blocks = data.get("Values")
+        if not isinstance(value_blocks, list):
+            value_blocks = [data.get("Value", {})]
+
+        for value in value_blocks:
+            if not isinstance(value, dict):
                 continue
-            devno = child.get("class") or child.get("devno") or base_class
-            if not devno:
+            base_class = value.get("class")
+            child_items = value.get("child") or []
+            if isinstance(child_items, dict):
+                child_items = [child_items]
+            if not isinstance(child_items, list):
                 continue
 
-            # Only expose real breaker devices as switch entities.
-            if not str(devno).startswith("BK"):
-                continue
+            for child in child_items:
+                if not isinstance(child, dict):
+                    continue
+                devno = child.get("class") or child.get("devno") or base_class
+                if not devno:
+                    continue
 
-            old_state = self.devices.get(devno, {}).get("state")
-            self.devices[devno] = {
-                "state": int(child.get("state", 0)),
-                "connected": int(data.get("connected", 0)),
-                "raw": child,
-                "meta": {
-                    "category": data.get("category"),
-                    "version": data.get("version"),
-                    "bus_id": data.get("BusID"),
-                    "devtag": data.get("devtag"),
-                },
-                "model": self._build_model_name(data),
-                "device_type": self._build_device_type(data),
-            }
-            self._handle_alarm_transition(devno)
-            if old_state is None or old_state != self.devices[devno]["state"]:
-                changed.add(devno)
-            if old_state is None:
-                self.hass.async_create_task(self._refresh_settings_for_device(devno))
+                # We only expose breaker subdevices (BK prefix) as requested.
+                if not str(devno).startswith("BK"):
+                    continue
+                if "state" not in child:
+                    continue
+
+                old_state = self.devices.get(devno, {}).get("state")
+                self.devices[devno] = {
+                    "state": int(child.get("state", 0)),
+                    "connected": int(data.get("connected", 0)),
+                    "raw": child,
+                    "meta": {
+                        "category": data.get("category"),
+                        "version": data.get("version"),
+                        "bus_id": data.get("BusID"),
+                        "devtag": data.get("devtag"),
+                    },
+                    "model": self._build_model_name(data),
+                    "device_type": self._build_device_type(data),
+                }
+                self._handle_alarm_transition(devno)
+                if old_state is None or old_state != self.devices[devno]["state"]:
+                    changed.add(devno)
+                if old_state is None:
+                    self.hass.async_create_task(self._refresh_settings_for_device(devno))
 
         self._notify_listeners(changed)
 
@@ -772,7 +780,10 @@ class WeiyuGatewayClient:
         """Actively poll subdevice data at configured interval."""
         while True:
             try:
-                await asyncio.sleep(max(5, int(self._target_report_cycle_seconds)))
+                interval = max(5, int(self._target_report_cycle_seconds))
+                if monotonic() < self._fast_poll_until_monotonic:
+                    interval = 5
+                await asyncio.sleep(interval)
                 if not self._gateway_writer:
                     return
                 self._prune_pending_subdev_requests()
