@@ -9,6 +9,7 @@ import logging
 import socket
 import uuid
 from collections.abc import Callable
+from collections import deque
 from time import monotonic
 
 from homeassistant.core import HomeAssistant
@@ -57,10 +58,12 @@ class WeiyuGatewayClient:
         self._alarm_cache: dict[str, bool] = {}
         self._device_settings_cache: dict[str, dict[str, dict]] = {}
         self._last_report_monotonic: float = monotonic()
-        self._target_report_cycle_seconds: int = 15
-        self._report_cycle_applied: bool = False
+        self._target_report_cycle_seconds: int = 20
+        self._request_results: deque[tuple[float, bool]] = deque(maxlen=1024)
+        self._pending_subdev_requests: deque[float] = deque(maxlen=256)
+        self._last_heartbeat_monotonic: float | None = None
+        self._last_heartbeat_iso: str | None = None
         self._gateway_setting_values: dict[str, float] = {
-            "report_cycle": 15.0,
             "ov_fault": 275.0,
             "ov_alarm": 265.0,
             "ov_recover": 230.0,
@@ -165,20 +168,10 @@ class WeiyuGatewayClient:
 
     def get_gateway_setting_value(self, key: str) -> float | None:
         """Get in-memory gateway setting value."""
-        if key == "report_cycle":
-            return float(self._target_report_cycle_seconds)
         return self._gateway_setting_values.get(key)
 
     def set_gateway_setting_value(self, key: str, value: float) -> None:
         """Set in-memory gateway setting value."""
-        if key == "report_cycle":
-            cycle = max(5, min(3600, int(value)))
-            self._target_report_cycle_seconds = cycle
-            self._gateway_setting_values["report_cycle"] = float(cycle)
-            self.gateway_info["report_cycle"] = cycle
-            if self._gateway_writer:
-                self.hass.async_create_task(self._ensure_gateway_report_cycle())
-            return
         if key in self._gateway_setting_values:
             self._gateway_setting_values[key] = float(value)
 
@@ -281,7 +274,13 @@ class WeiyuGatewayClient:
 
     async def async_request_subdevices(self) -> None:
         """Actively request sub-device list/state snapshot."""
-        await self._async_send_packet({"actionType": "report", "actionTarget": "subdev"})
+        try:
+            await self._async_send_packet({"actionType": "report", "actionTarget": "subdev"})
+            self._pending_subdev_requests.append(monotonic())
+            self._prune_pending_subdev_requests()
+        except Exception:
+            self._record_request_result(False)
+            raise
 
     async def _register_service_ip(self) -> None:
         """Register HA service address to gateway port 50500."""
@@ -348,10 +347,10 @@ class WeiyuGatewayClient:
             self.gateway_info["connected"] = 1
 
         _LOGGER.info("Weiyu gateway connected from %s", writer.get_extra_info("peername"))
+        self._enable_tcp_keepalive(writer)
         self._notify_listeners(set())
         await self._async_send_packet({"actionType": "report", "actionTarget": "subver"})
         await self.async_request_subdevices()
-        await self._ensure_gateway_report_cycle()
         if self._settings_refresh_task and not self._settings_refresh_task.done():
             self._settings_refresh_task.cancel()
         self._settings_refresh_task = self.hass.async_create_task(self._delayed_refresh_all_settings())
@@ -419,6 +418,8 @@ class WeiyuGatewayClient:
         if heartbeat and heartbeat_key:
             if not self.gateway_info.get("model") or self.gateway_info.get("model") == "Unknown":
                 self.gateway_info["model"] = str(heartbeat)
+            self._last_heartbeat_monotonic = monotonic()
+            self._last_heartbeat_iso = dt_util.utcnow().isoformat()
             # Some firmwares use "heatbeat" key; echo original key for compatibility.
             await self._async_send_packet({heartbeat_key: heartbeat, "connected": 1})
             self._notify_listeners(set())
@@ -447,36 +448,48 @@ class WeiyuGatewayClient:
             _LOGGER.warning("Failed to decode subclass payload")
             return
 
+        self._resolve_pending_subdev_request(True)
+
         value = data.get("Value", {})
-        devno = value.get("class")
-        child = (value.get("child") or [{}])[0]
-        if not devno or not isinstance(child, dict):
+        base_class = value.get("class")
+        child_items = value.get("child") or []
+        if isinstance(child_items, dict):
+            child_items = [child_items]
+        if not isinstance(child_items, list):
             return
 
-        # Only expose real breaker devices as switch entities.
-        # Gateway/summary objects from some subclass reports should be ignored.
-        if not str(devno).startswith("BK"):
-            return
+        changed: set[str] = set()
+        for child in child_items:
+            if not isinstance(child, dict):
+                continue
+            devno = child.get("class") or child.get("devno") or base_class
+            if not devno:
+                continue
 
-        old_state = self.devices.get(devno, {}).get("state")
-        self.devices[devno] = {
-            "state": int(child.get("state", 0)),
-            "connected": int(data.get("connected", 0)),
-            "raw": child,
-            "meta": {
-                "category": data.get("category"),
-                "version": data.get("version"),
-                "bus_id": data.get("BusID"),
-                "devtag": data.get("devtag"),
-            },
-            "model": self._build_model_name(data),
-            "device_type": self._build_device_type(data),
-        }
-        self._handle_alarm_transition(devno)
-        changed = {devno} if old_state != self.devices[devno]["state"] else set()
-        if old_state is None:
-            changed = {devno}
-            self.hass.async_create_task(self._refresh_settings_for_device(devno))
+            # Only expose real breaker devices as switch entities.
+            if not str(devno).startswith("BK"):
+                continue
+
+            old_state = self.devices.get(devno, {}).get("state")
+            self.devices[devno] = {
+                "state": int(child.get("state", 0)),
+                "connected": int(data.get("connected", 0)),
+                "raw": child,
+                "meta": {
+                    "category": data.get("category"),
+                    "version": data.get("version"),
+                    "bus_id": data.get("BusID"),
+                    "devtag": data.get("devtag"),
+                },
+                "model": self._build_model_name(data),
+                "device_type": self._build_device_type(data),
+            }
+            self._handle_alarm_transition(devno)
+            if old_state is None or old_state != self.devices[devno]["state"]:
+                changed.add(devno)
+            if old_state is None:
+                self.hass.async_create_task(self._refresh_settings_for_device(devno))
+
         self._notify_listeners(changed)
 
     async def _async_send_packet(self, obj: dict) -> None:
@@ -541,34 +554,62 @@ class WeiyuGatewayClient:
             }
         )
 
-    async def _send_report_cycle_setting(self, cycle_seconds: int) -> None:
-        """Set gateway report cycle seconds."""
-        target_id = str(self.gateway_info.get("devno") or self.gateway_host)
-        encoded = base64.b64encode(json.dumps({"cycle": int(cycle_seconds)}, ensure_ascii=False).encode("utf-8")).decode()
-        await self._async_send_packet(
-            {
-                "actionType": "setting",
-                "actionTarget": "reportCycle",
-                "targetId": target_id,
-                "evtId": str(uuid.uuid4()),
-                "data": encoded,
-            }
-        )
-
-    async def _ensure_gateway_report_cycle(self) -> None:
-        """Try to apply desired report cycle to gateway."""
-        try:
-            await self._send_report_cycle_setting(self._target_report_cycle_seconds)
-            self.gateway_info["report_cycle"] = self._target_report_cycle_seconds
-            self._report_cycle_applied = True
-            self._notify_listeners(set())
-        except Exception as exc:
-            _LOGGER.debug("Set gateway report cycle failed: %s", exc)
-
     def _notify_listeners(self, changed_devnos: set[str]) -> None:
         """Notify entity listeners."""
         for listener in list(self._listeners):
             listener(changed_devnos)
+
+    def _record_request_result(self, success: bool) -> None:
+        """Store one request result sample for diagnostics."""
+        self._request_results.append((monotonic(), success))
+
+    def _prune_pending_subdev_requests(self, timeout_seconds: int = 30) -> None:
+        """Expire timed-out subdev requests and mark as failed."""
+        now = monotonic()
+        while self._pending_subdev_requests and now - self._pending_subdev_requests[0] > timeout_seconds:
+            self._pending_subdev_requests.popleft()
+            self._record_request_result(False)
+
+    def _resolve_pending_subdev_request(self, success: bool) -> None:
+        """Resolve one pending subdev request."""
+        self._prune_pending_subdev_requests()
+        if self._pending_subdev_requests:
+            self._pending_subdev_requests.popleft()
+            self._record_request_result(success)
+
+    def _get_request_stats(self, window_seconds: int = 600) -> tuple[int, int]:
+        """Return total and success counts in recent window."""
+        now = monotonic()
+        while self._request_results and now - self._request_results[0][0] > window_seconds:
+            self._request_results.popleft()
+        total = len(self._request_results)
+        success = sum(1 for _, ok in self._request_results if ok)
+        return total, success
+
+    def get_request_success_rate_10m(self) -> float | None:
+        """Return request success rate in last 10 minutes."""
+        total, success = self._get_request_stats(600)
+        if total == 0:
+            return None
+        return round((success / total) * 100.0, 2)
+
+    def get_gateway_health_score(self) -> int:
+        """Return communication health score (0~100)."""
+        rate = self.get_request_success_rate_10m()
+        score = 100.0 if rate is None else float(rate)
+        if int(self.gateway_info.get("connected", 0) or 0) == 0:
+            score = min(score, 20.0)
+        if self._last_heartbeat_monotonic is not None:
+            heartbeat_silence = monotonic() - self._last_heartbeat_monotonic
+            if heartbeat_silence > 90:
+                score -= 20.0
+            if heartbeat_silence > 180:
+                score -= 30.0
+        return int(max(0.0, min(100.0, score)))
+
+    def get_last_heartbeat_time(self) -> str:
+        """Return last heartbeat timestamp in ISO format."""
+        return self._last_heartbeat_iso or ""
 
     async def _try_re_register(self) -> None:
         """Best-effort re-register service endpoint after disconnect."""
@@ -725,34 +766,35 @@ class WeiyuGatewayClient:
             self.gateway_info["version"] = version
         if devno:
             self.gateway_info["devno"] = devno
-        cycle = data.get("reprotCycle")
-        if cycle is None:
-            cycle = data.get("reportCycle")
-        if cycle is not None:
-            try:
-                cycle_val = int(cycle)
-                self.gateway_info["report_cycle"] = cycle_val
-                self._target_report_cycle_seconds = cycle_val
-                self._gateway_setting_values["report_cycle"] = float(cycle_val)
-            except (TypeError, ValueError):
-                pass
-        if devno and not self._report_cycle_applied:
-            self.hass.async_create_task(self._ensure_gateway_report_cycle())
         self._notify_listeners(set())
 
     async def _watchdog_loop(self) -> None:
-        """Event-driven mode with timeout-based compensating refresh."""
+        """Actively poll subdevice data at configured interval."""
         while True:
             try:
-                await asyncio.sleep(15)
+                await asyncio.sleep(max(5, int(self._target_report_cycle_seconds)))
                 if not self._gateway_writer:
                     return
-                if monotonic() - self._last_report_monotonic >= 45:
-                    await self.async_request_subdevices()
+                self._prune_pending_subdev_requests()
+                await self.async_request_subdevices()
             except asyncio.CancelledError:
                 return
             except Exception as exc:
-                _LOGGER.debug("Watchdog refresh failed: %s", exc)
+                _LOGGER.debug("Active polling failed: %s", exc)
+                self.gateway_info["connected"] = 0
+                self._notify_listeners(set())
+                await self._try_re_register()
+
+    @staticmethod
+    def _enable_tcp_keepalive(writer: asyncio.StreamWriter) -> None:
+        """Enable TCP keepalive on accepted gateway socket."""
+        sock = writer.get_extra_info("socket")
+        if sock is None:
+            return
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except OSError:
+            return
 
     def _handle_alarm_transition(self, devno: str) -> None:
         """Emit event and notification when device enters alarm state."""

@@ -23,17 +23,6 @@ class WeiyuSettingNumberDescription(NumberEntityDescription):
 
 SETTING_NUMBERS: tuple[WeiyuSettingNumberDescription, ...] = (
     WeiyuSettingNumberDescription(
-        key="report_cycle",
-        name="网关上报周期",
-        icon="mdi:timer-sync",
-        native_min_value=5,
-        native_max_value=3600,
-        native_step=1,
-        native_unit_of_measurement=UnitOfTime.SECONDS,
-        mode=NumberMode.BOX,
-        setting_key="report_cycle",
-    ),
-    WeiyuSettingNumberDescription(
         key="ov_fault",
         name="过压故障阈值",
         icon="mdi:flash-alert",

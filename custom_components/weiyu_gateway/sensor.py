@@ -129,8 +129,10 @@ async def async_setup_entry(
     client: WeiyuGatewayClient = hass.data[DOMAIN][entry.entry_id]
     known: set[tuple[str, str]] = set()
     gateway_entity = WeiyuGatewayStatusSensor(client, entry.entry_id)
-    entities: list[SensorEntity] = [gateway_entity]
-    async_add_entities([gateway_entity])
+    gateway_health = WeiyuGatewayHealthSensor(client, entry.entry_id)
+    gateway_req_rate = WeiyuGatewayRequestSuccessRateSensor(client, entry.entry_id)
+    entities: list[SensorEntity] = [gateway_entity, gateway_health, gateway_req_rate]
+    async_add_entities([gateway_entity, gateway_health, gateway_req_rate])
 
     @callback
     def _sync_entities(_: set[str]) -> None:
@@ -278,12 +280,74 @@ class WeiyuGatewayStatusSensor(SensorEntity):
             "固件版本": self._client.gateway_info.get("version", ""),
             "网关编号": self._client.gateway_info.get("devno", ""),
             "网关IP": self._client.gateway_host,
-            "上报周期(秒)": self._client.gateway_info.get("report_cycle", ""),
         }
 
     @property
     def device_info(self) -> dict:
         """Create gateway device card with requested display name."""
+        return {
+            "identifiers": self._client.get_gateway_identifiers(),
+            "name": self._client.get_gateway_name(),
+            "manufacturer": "Weiyu",
+            "model": self._client.gateway_info.get("model", "Unknown"),
+            "sw_version": self._client.gateway_info.get("version", ""),
+        }
+
+
+class WeiyuGatewayHealthSensor(SensorEntity):
+    """Gateway communication health score sensor."""
+
+    _attr_has_entity_name = True
+    _attr_name = "网关通信健康度"
+    _attr_icon = "mdi:heart-pulse"
+    _attr_native_unit_of_measurement = "%"
+
+    def __init__(self, client: WeiyuGatewayClient, entry_id: str) -> None:
+        self._client = client
+        self._attr_unique_id = f"weiyu_gateway_{entry_id}_health_score"
+
+    @property
+    def native_value(self) -> int:
+        """Return communication health score."""
+        return self._client.get_gateway_health_score()
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        """Provide heartbeat info for diagnostics."""
+        return {"最近心跳时间": self._client.get_last_heartbeat_time()}
+
+    @property
+    def device_info(self) -> dict:
+        """Bind entity to gateway device."""
+        return {
+            "identifiers": self._client.get_gateway_identifiers(),
+            "name": self._client.get_gateway_name(),
+            "manufacturer": "Weiyu",
+            "model": self._client.gateway_info.get("model", "Unknown"),
+            "sw_version": self._client.gateway_info.get("version", ""),
+        }
+
+
+class WeiyuGatewayRequestSuccessRateSensor(SensorEntity):
+    """Gateway request success rate in 10 minutes."""
+
+    _attr_has_entity_name = True
+    _attr_name = "最近10分钟请求成功率"
+    _attr_icon = "mdi:chart-line"
+    _attr_native_unit_of_measurement = "%"
+
+    def __init__(self, client: WeiyuGatewayClient, entry_id: str) -> None:
+        self._client = client
+        self._attr_unique_id = f"weiyu_gateway_{entry_id}_request_success_rate_10m"
+
+    @property
+    def native_value(self) -> float | None:
+        """Return request success rate over last 10 minutes."""
+        return self._client.get_request_success_rate_10m()
+
+    @property
+    def device_info(self) -> dict:
+        """Bind entity to gateway device."""
         return {
             "identifiers": self._client.get_gateway_identifiers(),
             "name": self._client.get_gateway_name(),

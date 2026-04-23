@@ -11,4 +11,4 @@ CONF_LISTEN_PORT = "listen_port"
 
 DEFAULT_LISTEN_PORT = 23456
 
-PLATFORMS: list[Platform] = [Platform.SWITCH, Platform.SENSOR, Platform.BUTTON, Platform.BINARY_SENSOR, Platform.NUMBER]
+PLATFORMS: list[Platform] = [Platform.SWITCH, Platform.SENSOR, Platform.BUTTON, Platform.NUMBER]
