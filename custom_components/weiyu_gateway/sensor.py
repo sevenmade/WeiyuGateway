@@ -144,6 +144,8 @@ async def async_setup_entry(
                 new_entities.append(status_sensor)
 
             for desc in SENSOR_TYPES:
+                if desc.key == "leakage_current" and not client.is_leakage_protection_device(devno):
+                    continue
                 key = (devno, desc.key)
                 if key in known:
                     continue
@@ -179,6 +181,8 @@ class WeiyuSensor(SensorEntity):
     @property
     def native_value(self) -> float | None:
         """Return sensor state."""
+        if self.entity_description.key == "leakage_current" and not self._client.is_leakage_protection_device(self._devno):
+            return None
         device = self._client.get_device_data(self._devno)
         raw = device.get("raw", {})
         value = raw.get(self.entity_description.source_key)

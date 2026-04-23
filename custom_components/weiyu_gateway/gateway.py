@@ -12,6 +12,7 @@ from collections.abc import Callable
 from time import monotonic
 
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
@@ -59,6 +60,7 @@ class WeiyuGatewayClient:
         self._target_report_cycle_seconds: int = 15
         self._report_cycle_applied: bool = False
         self._gateway_setting_values: dict[str, float] = {
+            "report_cycle": 15.0,
             "ov_fault": 275.0,
             "ov_alarm": 265.0,
             "ov_recover": 230.0,
@@ -108,7 +110,10 @@ class WeiyuGatewayClient:
             self._settings_refresh_task.cancel()
         if self._gateway_writer:
             self._gateway_writer.close()
-            await self._gateway_writer.wait_closed()
+            try:
+                await self._gateway_writer.wait_closed()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
         if self._server:
             self._server.close()
             await self._server.wait_closed()
@@ -160,10 +165,20 @@ class WeiyuGatewayClient:
 
     def get_gateway_setting_value(self, key: str) -> float | None:
         """Get in-memory gateway setting value."""
+        if key == "report_cycle":
+            return float(self._target_report_cycle_seconds)
         return self._gateway_setting_values.get(key)
 
     def set_gateway_setting_value(self, key: str, value: float) -> None:
         """Set in-memory gateway setting value."""
+        if key == "report_cycle":
+            cycle = max(5, min(3600, int(value)))
+            self._target_report_cycle_seconds = cycle
+            self._gateway_setting_values["report_cycle"] = float(cycle)
+            self.gateway_info["report_cycle"] = cycle
+            if self._gateway_writer:
+                self.hass.async_create_task(self._ensure_gateway_report_cycle())
+            return
         if key in self._gateway_setting_values:
             self._gateway_setting_values[key] = float(value)
 
@@ -253,15 +268,16 @@ class WeiyuGatewayClient:
                 "bit": 0x0B,
             },
         )
-        await self._send_setting_write(
-            devno=devno,
-            payload={
-                "name": "leakcurrent",
-                "fault": int(self._gateway_setting_values["leak_fault"]),
-                "alarm": int(self._gateway_setting_values["leak_alarm"]),
-                "bit": 0x03,
-            },
-        )
+        if self.is_leakage_protection_device(devno):
+            await self._send_setting_write(
+                devno=devno,
+                payload={
+                    "name": "leakcurrent",
+                    "fault": int(self._gateway_setting_values["leak_fault"]),
+                    "alarm": int(self._gateway_setting_values["leak_alarm"]),
+                    "bit": 0x03,
+                },
+            )
 
     async def async_request_subdevices(self) -> None:
         """Actively request sub-device list/state snapshot."""
@@ -323,7 +339,10 @@ class WeiyuGatewayClient:
         async with self._lock:
             if self._gateway_writer:
                 self._gateway_writer.close()
-                await self._gateway_writer.wait_closed()
+                try:
+                    await self._gateway_writer.wait_closed()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
             self._gateway_reader = reader
             self._gateway_writer = writer
             self.gateway_info["connected"] = 1
@@ -463,7 +482,7 @@ class WeiyuGatewayClient:
     async def _async_send_packet(self, obj: dict) -> None:
         """Serialize and send one framed packet."""
         if not self._gateway_writer:
-            raise RuntimeError("Gateway is not connected")
+            raise HomeAssistantError("网关当前未连接，命令未发送")
         payload = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         frame = bytearray()
         frame.append(0xFA)
@@ -471,8 +490,28 @@ class WeiyuGatewayClient:
         frame.extend(payload)
         frame.append(sum(payload) & 0xFF)
         frame.append(0xFB)
-        self._gateway_writer.write(bytes(frame))
-        await self._gateway_writer.drain()
+        try:
+            self._gateway_writer.write(bytes(frame))
+            await self._gateway_writer.drain()
+        except (ConnectionResetError, BrokenPipeError, OSError) as exc:
+            await self._handle_send_connection_error(exc)
+            raise HomeAssistantError("网关连接已断开，请稍后重试") from exc
+
+    async def _handle_send_connection_error(self, exc: Exception) -> None:
+        """Handle connection-lost errors during command sending."""
+        _LOGGER.debug("Send failed due to connection issue: %s", exc)
+        self.gateway_info["connected"] = 0
+        writer = self._gateway_writer
+        self._gateway_writer = None
+        self._gateway_reader = None
+        if writer:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+        self._notify_listeners(set())
+        self.hass.async_create_task(self._try_re_register())
 
     async def _send_setting_write(self, devno: str, payload: dict) -> None:
         """Send setting/write command with base64 payload."""
@@ -567,7 +606,10 @@ class WeiyuGatewayClient:
 
     async def _refresh_settings_for_device(self, devno: str) -> None:
         """Read setting profiles from one subdevice."""
-        for name in ("overvoltage", "undervoltage", "overload", "leakcurrent"):
+        profile_names = ["overvoltage", "undervoltage", "overload"]
+        if self.is_leakage_protection_device(devno):
+            profile_names.append("leakcurrent")
+        for name in profile_names:
             try:
                 await self._send_setting_read(devno, name)
             except Exception as exc:
@@ -688,7 +730,10 @@ class WeiyuGatewayClient:
             cycle = data.get("reportCycle")
         if cycle is not None:
             try:
-                self.gateway_info["report_cycle"] = int(cycle)
+                cycle_val = int(cycle)
+                self.gateway_info["report_cycle"] = cycle_val
+                self._target_report_cycle_seconds = cycle_val
+                self._gateway_setting_values["report_cycle"] = float(cycle_val)
             except (TypeError, ValueError):
                 pass
         if devno and not self._report_cycle_applied:
