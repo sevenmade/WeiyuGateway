@@ -1,0 +1,40 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "配置微羽网关",
+        "description": "请选择添加方式。",
+        "data": {
+          "setup_mode": "添加方式"
+        }
+      },
+      "discover": {
+        "title": "选择网关",
+        "description": "已搜索到局域网网关，请从下拉菜单选择。",
+        "data": {
+          "discovered_gateway": "网关地址",
+          "listen_ip": "Home Assistant 监听IP",
+          "listen_port": "Home Assistant 监听端口"
+        }
+      },
+      "discover_failed": {
+        "title": "未发现网关",
+        "description": "未通过 UDP 发现网关，请选择下一步操作。",
+        "data": {
+          "setup_mode": "下一步"
+        }
+      },
+      "manual": {
+        "title": "手动配置微羽网关",
+        "data": {
+          "gateway_host": "网关 IP",
+          "listen_ip": "Home Assistant 监听IP",
+          "listen_port": "Home Assistant 监听端口"
+        }
+      }
+    },
+    "error": {
+      "discover_failed": "UDP 未发现网关，请手动填写网关IP或检查网络"
+    }
+  }
+}

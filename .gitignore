@@ -1,0 +1,4 @@
+# Local documents and private reference materials
+doc/
+__pycache__/
+*.pyc
