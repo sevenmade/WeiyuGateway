@@ -226,30 +226,13 @@ class WeiyuOperatingStatusSensor(SensorEntity):
         connected = int(data.get("connected", 0) or 0)
         raw = data.get("raw", {})
         wstate = int(raw.get("wstate", 0) or 0)
-        alarm = int(raw.get("alarm", 0) or 0)
-        fault = int(raw.get("fault", 0) or 0)
-        trip = int(raw.get("trip", 0) or 0)
-        pretrip = int(raw.get("pretrip", 0) or 0)
 
-        # Priority from severe to normal.
         if connected == 0:
             return "离线"
-        if fault > 0 or bool(wstate & (1 << 2)):
-            return "故障"
-        if trip > 0:
-            return "脱扣"
-        if pretrip > 0 or bool(wstate & (1 << 3)):
-            return "预脱扣"
-        if alarm > 0 or bool(wstate & (1 << 1)):
-            return "报警"
-        if bool(wstate & (1 << 4)):
-            return "漏电测试中"
         if bool(wstate & (1 << 5)):
             return "锁定"
         if bool(wstate & (1 << 6)):
             return "设置中"
-        if bool(wstate & (1 << 7)):
-            return "漏电测试成功"
         return "正常"
 
     @property
@@ -291,6 +274,7 @@ class WeiyuGatewayStatusSensor(SensorEntity):
             "固件版本": self._client.gateway_info.get("version", ""),
             "网关编号": self._client.gateway_info.get("devno", ""),
             "网关IP": self._client.gateway_host,
+            "上报周期(秒)": self._client.gateway_info.get("report_cycle", ""),
         }
 
     @property

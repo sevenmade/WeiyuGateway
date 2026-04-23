@@ -22,55 +22,7 @@ class WeiyuBinarySensorDescription(BinarySensorEntityDescription):
     bit_index: int | None = None
 
 
-BINARY_SENSOR_TYPES: tuple[WeiyuBinarySensorDescription, ...] = (
-    WeiyuBinarySensorDescription(
-        key="has_issue",
-        name="电气异常",
-        icon="mdi:alert",
-        source_key="wstate",
-        mode="combined",
-    ),
-    WeiyuBinarySensorDescription(
-        key="alarm",
-        name="告警",
-        icon="mdi:alarm-light",
-        source_key="alarm",
-    ),
-    WeiyuBinarySensorDescription(
-        key="fault",
-        name="故障",
-        icon="mdi:alert-circle",
-        source_key="fault",
-    ),
-    WeiyuBinarySensorDescription(
-        key="trip",
-        name="脱扣",
-        icon="mdi:lightning-bolt-outline",
-        source_key="trip",
-    ),
-    WeiyuBinarySensorDescription(
-        key="pretrip",
-        name="预脱扣",
-        icon="mdi:alert-outline",
-        source_key="pretrip",
-    ),
-    WeiyuBinarySensorDescription(
-        key="leakage_test_running",
-        name="漏电测试中",
-        icon="mdi:shield-sync",
-        source_key="wstate",
-        mode="bit",
-        bit_index=4,
-    ),
-    WeiyuBinarySensorDescription(
-        key="leakage_test_success",
-        name="漏电测试成功",
-        icon="mdi:shield-check",
-        source_key="wstate",
-        mode="bit",
-        bit_index=7,
-    ),
-)
+BINARY_SENSOR_TYPES: tuple[WeiyuBinarySensorDescription, ...] = ()
 
 
 async def async_setup_entry(

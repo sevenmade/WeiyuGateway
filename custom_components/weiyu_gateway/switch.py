@@ -108,8 +108,8 @@ class WeiyuGatewayMasterSwitch(SwitchEntity):
     """Gateway-level master switch for all subdevices."""
 
     _attr_has_entity_name = True
-    _attr_name = "全部子设备总开关"
-    _attr_icon = "mdi:power-cycle"
+    _attr_name = "总开关"
+    _attr_icon = "mdi:dip-switch"
 
     def __init__(self, client: WeiyuGatewayClient, entry_id: str) -> None:
         self._client = client
