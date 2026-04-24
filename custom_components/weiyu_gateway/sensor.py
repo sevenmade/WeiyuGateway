@@ -101,6 +101,16 @@ SENSOR_TYPES: tuple[WeiyuSensorDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
     ),
     WeiyuSensorDescription(
+        key="neutral_temperature",
+        name="零线温度",
+        source_key="ntemp",
+        divisor=100,
+        icon="mdi:thermometer",
+        device_class=SensorDeviceClass.TEMPERATURE,
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    WeiyuSensorDescription(
         key="chip_temperature",
         name="芯片温度",
         source_key="ctemp",
@@ -129,10 +139,9 @@ async def async_setup_entry(
     client: WeiyuGatewayClient = hass.data[DOMAIN][entry.entry_id]
     known: set[tuple[str, str]] = set()
     gateway_entity = WeiyuGatewayStatusSensor(client, entry.entry_id)
-    gateway_health = WeiyuGatewayHealthSensor(client, entry.entry_id)
-    gateway_req_rate = WeiyuGatewayRequestSuccessRateSensor(client, entry.entry_id)
-    entities: list[SensorEntity] = [gateway_entity, gateway_health, gateway_req_rate]
-    async_add_entities([gateway_entity, gateway_health, gateway_req_rate])
+    gateway_activity = WeiyuGatewayActivitySensor(client, entry.entry_id)
+    entities: list[SensorEntity] = [gateway_entity, gateway_activity]
+    async_add_entities([gateway_entity, gateway_activity])
 
     @callback
     def _sync_entities(_: set[str]) -> None:
@@ -154,6 +163,8 @@ async def async_setup_entry(
 
             for desc in SENSOR_TYPES:
                 if desc.key == "leakage_current" and not client.is_leakage_protection_device(devno):
+                    continue
+                if desc.key == "neutral_temperature" and not client.is_two_p_device(devno):
                     continue
                 key = (devno, desc.key)
                 if key in known:
@@ -191,6 +202,8 @@ class WeiyuSensor(SensorEntity):
     def native_value(self) -> float | None:
         """Return sensor state."""
         if self.entity_description.key == "leakage_current" and not self._client.is_leakage_protection_device(self._devno):
+            return None
+        if self.entity_description.key == "neutral_temperature" and not self._client.is_two_p_device(self._devno):
             return None
         device = self._client.get_device_data(self._devno)
         raw = device.get("raw", {})
@@ -235,18 +248,7 @@ class WeiyuOperatingStatusSensor(SensorEntity):
     @property
     def native_value(self) -> str:
         """Return merged operating status text."""
-        data = self._client.get_device_data(self._devno)
-        connected = int(data.get("connected", 0) or 0)
-        raw = data.get("raw", {})
-        wstate = int(raw.get("wstate", 0) or 0)
-
-        if connected == 0:
-            return "离线"
-        if bool(wstate & (1 << 5)):
-            return "锁定"
-        if bool(wstate & (1 << 6)):
-            return "设置中"
-        return "正常"
+        return self._client.get_operating_status_text(self._devno)
 
     @property
     def device_info(self) -> dict:
@@ -335,56 +337,21 @@ class WeiyuGatewayStatusSensor(SensorEntity):
         }
 
 
-class WeiyuGatewayHealthSensor(SensorEntity):
-    """Gateway communication health score sensor."""
+class WeiyuGatewayActivitySensor(SensorEntity):
+    """Gateway human-readable activity (e.g. scanning subdevices, reconnecting)."""
 
     _attr_has_entity_name = True
-    _attr_name = "网关通信健康度"
-    _attr_icon = "mdi:heart-pulse"
-    _attr_native_unit_of_measurement = "%"
+    _attr_name = "状态"
+    _attr_icon = "mdi:state-machine"
 
     def __init__(self, client: WeiyuGatewayClient, entry_id: str) -> None:
         self._client = client
-        self._attr_unique_id = f"weiyu_gateway_{entry_id}_health_score"
+        self._attr_unique_id = f"weiyu_gateway_{entry_id}_activity"
 
     @property
-    def native_value(self) -> int:
-        """Return communication health score."""
-        return self._client.get_gateway_health_score()
-
-    @property
-    def extra_state_attributes(self) -> dict:
-        """Provide heartbeat info for diagnostics."""
-        return {"最近心跳时间": self._client.get_last_heartbeat_time()}
-
-    @property
-    def device_info(self) -> dict:
-        """Bind entity to gateway device."""
-        return {
-            "identifiers": self._client.get_gateway_identifiers(),
-            "name": self._client.get_gateway_name(),
-            "manufacturer": "Weiyu",
-            "model": self._client.gateway_info.get("model", "Unknown"),
-            "sw_version": self._client.gateway_info.get("version", ""),
-        }
-
-
-class WeiyuGatewayRequestSuccessRateSensor(SensorEntity):
-    """Gateway request success rate in 10 minutes."""
-
-    _attr_has_entity_name = True
-    _attr_name = "最近10分钟请求成功率"
-    _attr_icon = "mdi:chart-line"
-    _attr_native_unit_of_measurement = "%"
-
-    def __init__(self, client: WeiyuGatewayClient, entry_id: str) -> None:
-        self._client = client
-        self._attr_unique_id = f"weiyu_gateway_{entry_id}_request_success_rate_10m"
-
-    @property
-    def native_value(self) -> float | None:
-        """Return request success rate over last 10 minutes."""
-        return self._client.get_request_success_rate_10m()
+    def native_value(self) -> str:
+        """Return current gateway activity text."""
+        return self._client.get_gateway_activity_text()
 
     @property
     def device_info(self) -> dict:

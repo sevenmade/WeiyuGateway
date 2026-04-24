@@ -17,9 +17,7 @@ async def async_setup_entry(
     """Set up action buttons from a config entry."""
     client: WeiyuGatewayClient = hass.data[DOMAIN][entry.entry_id]
     known_devnos: set[str] = set()
-    gateway_apply_button = WeiyuApplySettingsAllButton(client, entry.entry_id)
-    entities: list[ButtonEntity] = [gateway_apply_button]
-    async_add_entities([gateway_apply_button])
+    entities: list[ButtonEntity] = []
 
     @callback
     def _sync_entities(_: set[str]) -> None:
@@ -77,38 +75,4 @@ class WeiyuLeakageTestButton(ButtonEntity):
         await self._client.async_trigger_leakage_test(self._devno)
 
 
-class WeiyuApplySettingsAllButton(ButtonEntity):
-    """Apply gateway-level protection settings to all subdevices."""
 
-    _attr_has_entity_name = True
-    _attr_name = "应用保护参数到全部设备"
-    _attr_icon = "mdi:tune-variant"
-
-    def __init__(self, client: WeiyuGatewayClient, entry_id: str) -> None:
-        self._client = client
-        self._attr_unique_id = f"weiyu_gateway_{entry_id}_apply_settings_all"
-
-    @property
-    def device_info(self) -> dict:
-        """Bind this button to gateway device."""
-        return {
-            "identifiers": self._client.get_gateway_identifiers(),
-            "name": self._client.get_gateway_name(),
-            "manufacturer": "Weiyu",
-            "model": self._client.gateway_info.get("model", "Unknown"),
-            "sw_version": self._client.gateway_info.get("version", ""),
-        }
-
-    async def async_press(self) -> None:
-        """Handle button press."""
-        success, fail = await self._client.async_apply_gateway_settings_to_all()
-        await self._client.hass.services.async_call(
-            "persistent_notification",
-            "create",
-            {
-                "title": "微羽参数下发结果",
-                "message": f"已下发完成，成功 {success} 台，失败 {fail} 台。",
-                "notification_id": "weiyu_apply_settings_result",
-            },
-            blocking=False,
-        )

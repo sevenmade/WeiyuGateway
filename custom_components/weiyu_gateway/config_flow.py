@@ -97,10 +97,13 @@ class WeiyuGatewayConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Show discovery failed page with retry/manual choices."""
         errors: dict[str, str] = {}
         if user_input is not None:
-            mode = user_input[CONF_SETUP_MODE]
-            if mode == SETUP_MODE_DISCOVER:
+            mode = user_input.get(CONF_SETUP_MODE)
+            if mode not in (SETUP_MODE_DISCOVER, SETUP_MODE_MANUAL):
+                errors["base"] = "invalid_setup_mode"
+            elif mode == SETUP_MODE_DISCOVER:
                 return await self.async_step_discover()
-            return await self.async_step_manual()
+            else:
+                return await self.async_step_manual()
 
         schema = vol.Schema(
             {
