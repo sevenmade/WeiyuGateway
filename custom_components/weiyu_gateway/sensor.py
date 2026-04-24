@@ -154,13 +154,6 @@ async def async_setup_entry(
                 entities.append(status_sensor)
                 new_entities.append(status_sensor)
 
-            mode_key = (devno, "work_mode")
-            if mode_key not in known:
-                known.add(mode_key)
-                mode_sensor = WeiyuWorkModeSensor(client, devno)
-                entities.append(mode_sensor)
-                new_entities.append(mode_sensor)
-
             for desc in SENSOR_TYPES:
                 if desc.key == "leakage_current" and not client.is_leakage_protection_device(devno):
                     continue
@@ -249,40 +242,6 @@ class WeiyuOperatingStatusSensor(SensorEntity):
     def native_value(self) -> str:
         """Return merged operating status text."""
         return self._client.get_operating_status_text(self._devno)
-
-    @property
-    def device_info(self) -> dict:
-        """Bind entity to breaker device."""
-        data = self._client.get_device_data(self._devno)
-        return {
-            "identifiers": {("weiyu_gateway", self._devno)},
-            "name": self._client.get_device_name(self._devno),
-            "manufacturer": "微羽智能",
-            "model": data.get("model", "未知型号"),
-            "sw_version": data.get("meta", {}).get("version"),
-            "via_device": next(iter(self._client.get_gateway_identifiers())),
-        }
-
-
-class WeiyuWorkModeSensor(SensorEntity):
-    """Work mode sensor for one breaker."""
-
-    _attr_has_entity_name = True
-    _attr_name = "工作模式"
-    _attr_icon = "mdi:cog-transfer"
-
-    def __init__(self, client: WeiyuGatewayClient, devno: str) -> None:
-        self._client = client
-        self._devno = devno
-        self._attr_unique_id = f"weiyu_{devno}_work_mode"
-
-    @property
-    def native_value(self) -> str:
-        """Return work mode text from wmode field."""
-        data = self._client.get_device_data(self._devno)
-        raw = data.get("raw", {})
-        wmode = int(raw.get("wmode", 0) or 0)
-        return "手动" if wmode == 1 else "自动"
 
     @property
     def device_info(self) -> dict:

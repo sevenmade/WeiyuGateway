@@ -1,7 +1,7 @@
 {
   "domain": "weiyu_gateway",
   "name": "Weiyu Gateway",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "documentation": "https://github.com/sevenmade/WeiyuGateway",
   "requirements": [],
   "codeowners": [

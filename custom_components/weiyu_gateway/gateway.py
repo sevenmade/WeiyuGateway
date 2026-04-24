@@ -285,12 +285,26 @@ class WeiyuGatewayClient:
             tcp_exc = exc
             _LOGGER.debug("TCP register failed, try UDP fallback: %s", exc)
 
-        udp_text = await asyncio.to_thread(self._register_service_ip_udp, payload_bytes)
-        _LOGGER.debug("Weiyu register UDP response: %s", udp_text)
-        if "Set OK" not in udp_text:
-            raise RuntimeError(
-                f"Gateway register failed. TCP error: {tcp_exc!r}; UDP response: {udp_text or '<empty>'}"
-            )
+        udp_last_exc: Exception | None = None
+        udp_last_text = ""
+        for attempt in range(1, 4):
+            try:
+                udp_text = await asyncio.to_thread(self._register_service_ip_udp, payload_bytes)
+                udp_last_text = udp_text
+                _LOGGER.debug("Weiyu register UDP response (attempt %s): %s", attempt, udp_text)
+                if "Set OK" in udp_text:
+                    return
+                await asyncio.sleep(0.35 * attempt)
+            except Exception as exc:
+                udp_last_exc = exc
+                _LOGGER.debug("UDP register attempt %s failed: %s", attempt, exc)
+                await asyncio.sleep(0.35 * attempt)
+
+        raise RuntimeError(
+            "Gateway register failed. "
+            f"TCP error: {tcp_exc!r}; UDP error: {udp_last_exc!r}; "
+            f"UDP response: {udp_last_text or '<empty>'}"
+        )
 
     def _register_service_ip_udp(self, payload_bytes: bytes) -> str:
         """Fallback register over UDP for gateways without TCP 50500 listener."""
@@ -768,12 +782,17 @@ class WeiyuGatewayClient:
         data = self.devices.get(devno, {})
         raw = data.get("raw", {})
         wstate = int(raw.get("wstate", 0) or 0)
+        alarm_effective = self._filter_alarm_bits_for_notify(int(raw.get("alarm", 0) or 0))
+        fault_raw = int(raw.get("fault", 0) or 0)
+        fault_effective = self._filter_fault_bits_for_notify(fault_raw)
+        trip_effective = self._filter_trip_bits_for_notify(int(raw.get("trip", 0) or 0))
+        pretrip_effective = self._filter_pretrip_bits_for_notify(int(raw.get("pretrip", 0) or 0))
         has_issue = any(
             [
-                int(raw.get("alarm", 0) or 0) > 0,
-                int(raw.get("fault", 0) or 0) > 0,
-                int(raw.get("pretrip", 0) or 0) > 0,
-                int(raw.get("trip", 0) or 0) > 0,
+                alarm_effective > 0,
+                fault_effective > 0,
+                pretrip_effective > 0,
+                trip_effective > 0,
                 bool(wstate & ((1 << 1) | (1 << 2) | (1 << 3))),
             ]
         )
@@ -785,16 +804,18 @@ class WeiyuGatewayClient:
 
         device_name = self.get_device_name(devno)
         status_text = self._build_alarm_status_text(raw)
-        alarm_bits_text = self._build_alarm_bits_text(int(raw.get("alarm", 0) or 0))
-        fault_bits_text = self._build_fault_bits_text(int(raw.get("fault", 0) or 0))
+        alarm_bits_text = self._build_alarm_bits_text(alarm_effective)
+        fault_bits_text = self._build_fault_bits_text(fault_raw)
+        trip_bits_text = self._build_trip_bits_text(trip_effective)
+        pretrip_bits_text = self._build_pretrip_bits_text(pretrip_effective)
         alarm_payload = {
             "devno": devno,
             "name": device_name,
             "status": status_text,
-            "alarm": int(raw.get("alarm", 0) or 0),
-            "fault": int(raw.get("fault", 0) or 0),
-            "trip": int(raw.get("trip", 0) or 0),
-            "pretrip": int(raw.get("pretrip", 0) or 0),
+            "alarm": alarm_effective,
+            "fault": fault_effective,
+            "trip": trip_effective,
+            "pretrip": pretrip_effective,
             "voltage": self._scale_metric(raw.get("voltage"), 100),
             "current": self._scale_metric(raw.get("electric"), 1000),
             "power": self._scale_metric(raw.get("powerrate"), 100),
@@ -821,12 +842,10 @@ class WeiyuGatewayClient:
                         "检测到设备出现电气异常，请尽快检查。\n\n"
                         f"设备: {device_name}\n"
                         f"状态: {alarm_payload['status']}\n"
-                        f"告警位: {alarm_payload['alarm']}\n"
-                        f"告警细分: {alarm_bits_text}\n"
-                        f"故障位: {alarm_payload['fault']}\n"
-                        f"故障细分: {fault_bits_text}\n"
-                        f"脱扣位: {alarm_payload['trip']}\n"
-                        f"预脱扣位: {alarm_payload['pretrip']}\n"
+                        f"告警状态: {alarm_bits_text}\n"
+                        f"故障状态: {fault_bits_text}\n"
+                        f"脱扣状态: {trip_bits_text}\n"
+                        f"预脱扣状态: {pretrip_bits_text}\n"
                         f"电压: {self._fmt_metric(alarm_payload['voltage'], 'V')}\n"
                         f"电流: {self._fmt_metric(alarm_payload['current'], 'A')}\n"
                         f"有功功率: {self._fmt_metric(alarm_payload['power'], 'W')}\n"
@@ -910,14 +929,26 @@ class WeiyuGatewayClient:
             "time": cls._pick_raw_value(raw, ("alarm_time", "atime")),
             "count": cls._pick_raw_value(raw, ("alarm_count", "acnt")),
         }
-        fault = {k: v for k, v in fault.items() if v is not None}
-        alarm = {k: v for k, v in alarm.items() if v is not None}
+        fault = {k: v for k, v in fault.items() if cls._is_meaningful_record_value(k, v)}
+        alarm = {k: v for k, v in alarm.items() if cls._is_meaningful_record_value(k, v)}
         payload: dict[str, dict] = {}
         if fault:
             payload["fault_record"] = fault
         if alarm:
             payload["alarm_record"] = alarm
         return payload
+
+    @staticmethod
+    def _is_meaningful_record_value(key: str, value: object) -> bool:
+        """Filter placeholder values from record snapshot (e.g., all-zero metrics)."""
+        if value is None:
+            return False
+        if key in {"time", "count"}:
+            text = str(value).strip()
+            return text not in {"", "0", "0.0"}
+        if isinstance(value, (int, float)):
+            return abs(float(value)) > 1e-9
+        return True
 
     @classmethod
     def _build_record_lines(cls, record_payload: dict) -> list[str]:
@@ -968,12 +999,15 @@ class WeiyuGatewayClient:
     def _build_alarm_status_text(raw: dict) -> str:
         """Build merged status text for alarm notification."""
         wstate = int(raw.get("wstate", 0) or 0)
-        alarm = int(raw.get("alarm", 0) or 0)
-        fault = int(raw.get("fault", 0) or 0)
-        trip = int(raw.get("trip", 0) or 0)
-        pretrip = int(raw.get("pretrip", 0) or 0)
+        wmode = int(raw.get("wmode", 0) or 0)
+        alarm = WeiyuGatewayClient._filter_alarm_bits_for_notify(int(raw.get("alarm", 0) or 0))
+        fault = WeiyuGatewayClient._filter_fault_bits_for_notify(int(raw.get("fault", 0) or 0))
+        trip = WeiyuGatewayClient._filter_trip_bits_for_notify(int(raw.get("trip", 0) or 0))
+        pretrip = WeiyuGatewayClient._filter_pretrip_bits_for_notify(int(raw.get("pretrip", 0) or 0))
 
         states: list[str] = []
+        if wmode == 1:
+            states.append("锁定")
         if fault > 0 or bool(wstate & (1 << 2)):
             states.append("故障")
         if trip > 0:
@@ -1000,7 +1034,9 @@ class WeiyuGatewayClient:
         num = int(value)
         while num > 0:
             if num & 1:
-                out.append(labels.get(bit, f"{prefix}D{bit}"))
+                label = labels.get(bit)
+                if label:
+                    out.append(label)
             num >>= 1
             bit += 1
         return out
@@ -1008,6 +1044,7 @@ class WeiyuGatewayClient:
     @classmethod
     def _build_alarm_bits_text(cls, alarm: int) -> str:
         """Build decoded alarm text from alarm bitmap."""
+        alarm = cls._filter_alarm_bits_for_notify(alarm)
         labels = {
             0: "过压告警",
             1: "欠压告警",
@@ -1019,33 +1056,115 @@ class WeiyuGatewayClient:
         decoded = cls._decode_bit_labels(alarm, labels, "告警")
         return "无" if not decoded else "、".join(decoded)
 
+    @staticmethod
+    def _filter_alarm_bits_for_notify(alarm: int) -> int:
+        """Keep only documented alarm bits and ignore reserved/undefined ones."""
+        # Per current docs, keep alarm bits with clear semantics.
+        actionable_bits = (0, 1, 2, 3, 4, 5)
+        mask = 0
+        for bit in actionable_bits:
+            mask |= 1 << bit
+        return int(alarm) & mask
+
     @classmethod
     def _build_fault_bits_text(cls, fault: int) -> str:
         """Build decoded fault text from fault bitmap."""
+        fault = cls._filter_fault_bits_for_notify(fault)
         labels = {
-            0: "过压故障",
-            1: "欠压故障",
-            2: "过流/过载故障",
-            3: "漏电故障",
-            4: "温度故障",
-            5: "打火故障",
+            0: "过载故障",
+            1: "瞬时故障",
+            2: "漏电故障",
+            3: "欠压故障",
+            4: "过压故障",
+            5: "高过压故障",
+            6: "温度故障",
+            7: "硬件漏电故障",
+            10: "过功率故障",
+            11: "漏电试验故障",
+            12: "过用电量故障",
+            13: "恶性负载故障",
+            14: "打火故障",
         }
         decoded = cls._decode_bit_labels(fault, labels, "故障")
+        return "无" if not decoded else "、".join(decoded)
+
+    @staticmethod
+    def _filter_fault_bits_for_notify(fault: int) -> int:
+        """Keep only actionable fault bits and ignore reserved/undefined ones."""
+        # Ignore reserved/undefined bits (bit8 self-test indicator, bit9 undefined, bit15 reserved).
+        actionable_bits = (0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14)
+        mask = 0
+        for bit in actionable_bits:
+            mask |= 1 << bit
+        return int(fault) & mask
+
+    @staticmethod
+    def _filter_trip_bits_for_notify(trip: int) -> int:
+        """Keep only documented trip bits and ignore reserved/undefined ones."""
+        actionable_bits = (0, 1, 2, 3, 4, 5)
+        mask = 0
+        for bit in actionable_bits:
+            mask |= 1 << bit
+        return int(trip) & mask
+
+    @staticmethod
+    def _filter_pretrip_bits_for_notify(pretrip: int) -> int:
+        """Keep only documented pretrip bits and ignore reserved/undefined ones."""
+        actionable_bits = (0, 1, 2, 3, 4, 5)
+        mask = 0
+        for bit in actionable_bits:
+            mask |= 1 << bit
+        return int(pretrip) & mask
+
+    @classmethod
+    def _build_trip_bits_text(cls, trip: int) -> str:
+        """Build decoded trip text from bitmap."""
+        trip = cls._filter_trip_bits_for_notify(trip)
+        labels = {
+            0: "过压脱扣",
+            1: "欠压脱扣",
+            2: "过流/过载脱扣",
+            3: "漏电脱扣",
+            4: "温度脱扣",
+            5: "打火脱扣",
+        }
+        decoded = cls._decode_bit_labels(trip, labels, "脱扣")
+        return "无" if not decoded else "、".join(decoded)
+
+    @classmethod
+    def _build_pretrip_bits_text(cls, pretrip: int) -> str:
+        """Build decoded pretrip text from bitmap."""
+        pretrip = cls._filter_pretrip_bits_for_notify(pretrip)
+        labels = {
+            0: "过压预脱扣",
+            1: "欠压预脱扣",
+            2: "过流/过载预脱扣",
+            3: "漏电预脱扣",
+            4: "温度预脱扣",
+            5: "打火预脱扣",
+        }
+        decoded = cls._decode_bit_labels(pretrip, labels, "预脱扣")
         return "无" if not decoded else "、".join(decoded)
 
     def get_operating_status_text(self, devno: str) -> str:
         """Return merged status including alarm/fault details."""
         data = self.get_device_data(devno)
         connected = int(data.get("connected", 0) or 0)
+        state = int(data.get("state", 0) or 0)
         raw = data.get("raw", {})
         wstate = int(raw.get("wstate", 0) or 0)
-        alarm = int(raw.get("alarm", 0) or 0)
-        fault = int(raw.get("fault", 0) or 0)
+        wmode = int(raw.get("wmode", 0) or 0)
+        alarm = self._filter_alarm_bits_for_notify(int(raw.get("alarm", 0) or 0))
+        fault = self._filter_fault_bits_for_notify(int(raw.get("fault", 0) or 0))
+        trip = self._filter_trip_bits_for_notify(int(raw.get("trip", 0) or 0))
+        pretrip = self._filter_pretrip_bits_for_notify(int(raw.get("pretrip", 0) or 0))
         parts: list[str] = []
 
         if connected == 0:
             return "离线"
-        if bool(wstate & (1 << 5)):
+        if state == 0:
+            parts.append("断电")
+        if wmode == 1 or bool(wstate & (1 << 5)):
             parts.append("锁定")
         if bool(wstate & (1 << 6)):
             parts.append("设置中")
@@ -1053,9 +1172,9 @@ class WeiyuGatewayClient:
             parts.append(f"告警({self._build_alarm_bits_text(alarm)})")
         if fault > 0:
             parts.append(f"故障({self._build_fault_bits_text(fault)})")
-        if int(raw.get("trip", 0) or 0) > 0:
+        if trip > 0:
             parts.append("脱扣")
-        if int(raw.get("pretrip", 0) or 0) > 0:
+        if pretrip > 0:
             parts.append("预脱扣")
 
         if not parts:
