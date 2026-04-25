@@ -76,6 +76,7 @@ class WeiyuGatewayClient:
         self._last_register_ok_monotonic: float = 0.0
         self._last_heartbeat_monotonic: float = monotonic()
         self._skip_next_post_connect_scan: bool = False
+        self._last_pre_switch_register_monotonic: float = 0.0
 
     def set_gateway_activity(self, text: str) -> None:
         """Human-readable gateway task state for UI (not used for heartbeat send/recv text)."""
@@ -358,6 +359,7 @@ class WeiyuGatewayClient:
             self._last_gateway_payload_monotonic = monotonic()
             self._connected_since_monotonic = monotonic()
             self._last_heartbeat_monotonic = monotonic()
+            self._last_pre_switch_register_monotonic = monotonic()
 
         _LOGGER.info("Weiyu gateway connected from %s", writer.get_extra_info("peername"))
         self.set_gateway_activity("已连接")
@@ -715,6 +717,22 @@ class WeiyuGatewayClient:
                 await asyncio.sleep(5)
                 connected = int(self.gateway_info.get("connected", 0) or 0)
                 if connected == 1:
+                    # Pre-switch registration near expected gateway session cutoff (~186s observed).
+                    # Goal: let gateway establish a fresh TCP session before hard EOF.
+                    connected_for = (
+                        monotonic() - self._connected_since_monotonic
+                        if self._connected_since_monotonic is not None
+                        else 0.0
+                    )
+                    if connected_for > 165 and monotonic() - self._last_pre_switch_register_monotonic > 90:
+                        try:
+                            await self._register_service_ip()
+                            self._last_pre_switch_register_monotonic = monotonic()
+                            self._skip_next_post_connect_scan = True
+                            _LOGGER.debug("Pre-switch service registration refresh: ok")
+                        except Exception as exc:
+                            _LOGGER.debug("Pre-switch service registration refresh failed: %s", exc)
+
                     # Some gateway firmwares appear to expire service registration around ~190s.
                     # Refresh registration before expiry to reduce periodic forced disconnects.
                     if monotonic() - self._last_register_ok_monotonic > 120:
