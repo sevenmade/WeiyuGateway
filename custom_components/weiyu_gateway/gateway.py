@@ -75,6 +75,7 @@ class WeiyuGatewayClient:
         self._connected_since_monotonic: float | None = None
         self._last_register_ok_monotonic: float = 0.0
         self._last_heartbeat_monotonic: float = monotonic()
+        self._skip_next_post_connect_scan: bool = False
 
     def set_gateway_activity(self, text: str) -> None:
         """Human-readable gateway task state for UI (not used for heartbeat send/recv text)."""
@@ -370,7 +371,12 @@ class WeiyuGatewayClient:
         # Reader must run before post-connect scan so subdev/subclass replies are not missed.
         self._read_task = self.hass.async_create_task(self._read_loop(session_gen))
         self.hass.async_create_task(self._sync_gateway_time_after_connect())
-        self.hass.async_create_task(self._post_connect_scan_subdevices())
+        if self._skip_next_post_connect_scan:
+            self._skip_next_post_connect_scan = False
+            self.set_gateway_activity("运行中")
+            self._notify_listeners(set())
+        else:
+            self.hass.async_create_task(self._post_connect_scan_subdevices())
 
     async def _read_loop(self, session_gen: int) -> None:
         """Read and parse framed protocol packets."""
@@ -396,18 +402,21 @@ class WeiyuGatewayClient:
             _LOGGER.debug("Weiyu read loop ended for superseded TCP session (gen %s)", session_gen)
             return
 
-        eof_wait_start = monotonic()
-        eof_heartbeat_mark = self._last_heartbeat_monotonic
-        _LOGGER.debug("Gateway EOF received, wait up to 15s for next heartbeat/session")
-        for _ in range(30):
+        _LOGGER.debug("Gateway EOF received, wait 5s then fast re-register (up to 3 attempts)")
+        await asyncio.sleep(5)
+        for attempt in range(1, 4):
             if session_gen != self._io_generation:
-                _LOGGER.debug("EOF grace window closed by new TCP session (gen switched)")
+                _LOGGER.debug("EOF fast re-register closed by new TCP session (gen switched)")
                 return
-            if self._last_heartbeat_monotonic > eof_heartbeat_mark:
-                delta_s = monotonic() - eof_wait_start
-                _LOGGER.debug("EOF grace window closed by heartbeat activity (EOF->heartbeat %.3fs)", delta_s)
+            try:
+                await self._register_service_ip()
+                self._skip_next_post_connect_scan = True
+                self.set_gateway_activity("等待回连")
+                _LOGGER.debug("EOF fast re-register attempt %s succeeded", attempt)
                 return
-            await asyncio.sleep(0.5)
+            except Exception as exc:
+                _LOGGER.debug("EOF fast re-register attempt %s failed: %s", attempt, exc)
+                await asyncio.sleep(1.0)
 
         connected_for = None
         if self._connected_since_monotonic is not None:
@@ -714,42 +723,6 @@ class WeiyuGatewayClient:
                             _LOGGER.debug("Periodic service registration refresh: ok")
                         except Exception as exc:
                             _LOGGER.debug("Periodic service registration refresh failed: %s", exc)
-
-                    # Heartbeat-first liveness: mark offline if no heartbeat >15s.
-                    timeout_s = 15
-                    silent_hb_s = monotonic() - self._last_heartbeat_monotonic
-                    if silent_hb_s > timeout_s:
-                        _LOGGER.warning(
-                            "Gateway heartbeat silent for %.1fs (timeout=%ss), mark offline and re-register",
-                            silent_hb_s,
-                            timeout_s,
-                        )
-                        self._io_generation += 1
-                        read_task = self._read_task
-                        self._read_task = None
-                        if read_task and not read_task.done():
-                            read_task.cancel()
-                            try:
-                                await read_task
-                            except asyncio.CancelledError:
-                                pass
-                            except Exception:
-                                pass
-                        self.gateway_info["connected"] = 0
-                        self._connected_since_monotonic = None
-                        self.set_gateway_activity("心跳超时重连")
-                        writer = self._gateway_writer
-                        self._gateway_writer = None
-                        self._gateway_reader = None
-                        if writer:
-                            writer.close()
-                            try:
-                                await writer.wait_closed()
-                            except (BrokenPipeError, ConnectionResetError, OSError):
-                                pass
-                        self._notify_listeners(set())
-                        await self._try_re_register()
-                        continue
 
                     # Fallback payload-silence guard.
                     timeout_s = max(180, int(self._target_report_cycle_seconds) * 3 + 90)
