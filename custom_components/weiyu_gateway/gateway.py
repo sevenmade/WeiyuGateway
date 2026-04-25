@@ -396,6 +396,19 @@ class WeiyuGatewayClient:
             _LOGGER.debug("Weiyu read loop ended for superseded TCP session (gen %s)", session_gen)
             return
 
+        eof_wait_start = monotonic()
+        eof_heartbeat_mark = self._last_heartbeat_monotonic
+        _LOGGER.debug("Gateway EOF received, wait up to 15s for next heartbeat/session")
+        for _ in range(30):
+            if session_gen != self._io_generation:
+                _LOGGER.debug("EOF grace window closed by new TCP session (gen switched)")
+                return
+            if self._last_heartbeat_monotonic > eof_heartbeat_mark:
+                delta_s = monotonic() - eof_wait_start
+                _LOGGER.debug("EOF grace window closed by heartbeat activity (EOF->heartbeat %.3fs)", delta_s)
+                return
+            await asyncio.sleep(0.5)
+
         connected_for = None
         if self._connected_since_monotonic is not None:
             connected_for = monotonic() - self._connected_since_monotonic
