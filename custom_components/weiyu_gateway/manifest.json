@@ -1,11 +1,12 @@
 {
   "domain": "weiyu_gateway",
   "name": "Weiyu Gateway",
-  "version": "1.2.5",
+  "version": "1.2.6",
   "documentation": "https://github.com/sevenmade/WeiyuGateway",
+  "issue_tracker": "https://github.com/sevenmade/WeiyuGateway/issues",
   "requirements": [],
   "codeowners": [
-    "@local"
+    "@sevenmade"
   ],
   "config_flow": true,
   "iot_class": "local_push"

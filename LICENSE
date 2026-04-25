@@ -19,3 +19,13 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+Third-party notice
+
+This project is an independent, unofficial integration for Home Assistant.
+It is not affiliated with, endorsed by, or sponsored by the manufacturers of
+referenced devices, Home Assistant, or any trademark owners mentioned in the
+documentation. Third-party names and marks are used solely for identification
+and compatibility description. See DISCLAIMER.md in this repository.

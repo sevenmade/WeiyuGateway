@@ -1,4 +1,6 @@
 # Local documents and private reference materials
 doc/
+# Optional local debug scripts (not required for the integration)
+tools/
 __pycache__/
 *.pyc
