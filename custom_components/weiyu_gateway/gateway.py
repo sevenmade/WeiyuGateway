@@ -391,7 +391,6 @@ class WeiyuGatewayClient:
                 # EOF path uses short-timeout retry to minimize reconnect blackout window.
                 await self._register_service_ip(udp_timeout_s=1.8)
                 self._skip_next_post_connect_scan = True
-                self.set_gateway_activity("等待回连")
                 _LOGGER.debug("EOF fast UDP re-register attempt %s succeeded", attempt)
                 return
             except Exception as exc:
