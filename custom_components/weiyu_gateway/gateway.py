@@ -76,7 +76,6 @@ class WeiyuGatewayClient:
         self._last_register_ok_monotonic: float = 0.0
         self._last_heartbeat_monotonic: float = monotonic()
         self._skip_next_post_connect_scan: bool = False
-        self._last_pre_switch_register_monotonic: float = 0.0
 
     def set_gateway_activity(self, text: str) -> None:
         """Human-readable gateway task state for UI (not used for heartbeat send/recv text)."""
@@ -267,7 +266,7 @@ class WeiyuGatewayClient:
             raise
 
     async def _register_service_ip(self) -> None:
-        """Register HA service address to gateway port 50500."""
+        """Register HA service address to gateway via UDP 50500 only."""
         register_payload = (
             json.dumps(
                 {
@@ -280,25 +279,6 @@ class WeiyuGatewayClient:
             + "\r\n"
         )
         payload_bytes = register_payload.encode("utf-8")
-
-        # Most models accept TCP on 50500. Some firmwares only respond via UDP.
-        tcp_exc: Exception | None = None
-        try:
-            reader, writer = await asyncio.open_connection(self.gateway_host, 50500)
-            writer.write(payload_bytes)
-            await writer.drain()
-            response = await asyncio.wait_for(reader.read(128), timeout=5)
-            writer.close()
-            await writer.wait_closed()
-            text = response.decode(errors="ignore").strip()
-            _LOGGER.debug("Weiyu register TCP response: %s", text)
-            if "Set OK" not in text:
-                raise RuntimeError(f"Unexpected TCP register response: {text or '<empty>'}")
-            self._last_register_ok_monotonic = monotonic()
-            return
-        except Exception as exc:
-            tcp_exc = exc
-            _LOGGER.debug("TCP register failed, try UDP fallback: %s", exc)
 
         udp_last_exc: Exception | None = None
         udp_last_text = ""
@@ -317,13 +297,12 @@ class WeiyuGatewayClient:
                 await asyncio.sleep(0.35 * attempt)
 
         raise RuntimeError(
-            "Gateway register failed. "
-            f"TCP error: {tcp_exc!r}; UDP error: {udp_last_exc!r}; "
-            f"UDP response: {udp_last_text or '<empty>'}"
+            "Gateway register failed via UDP. "
+            f"UDP error: {udp_last_exc!r}; UDP response: {udp_last_text or '<empty>'}"
         )
 
     def _register_service_ip_udp(self, payload_bytes: bytes) -> str:
-        """Fallback register over UDP for gateways without TCP 50500 listener."""
+        """Register service endpoint over UDP 50500."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             sock.settimeout(5)
@@ -359,7 +338,6 @@ class WeiyuGatewayClient:
             self._last_gateway_payload_monotonic = monotonic()
             self._connected_since_monotonic = monotonic()
             self._last_heartbeat_monotonic = monotonic()
-            self._last_pre_switch_register_monotonic = monotonic()
 
         _LOGGER.info("Weiyu gateway connected from %s", writer.get_extra_info("peername"))
         self.set_gateway_activity("已连接")
@@ -404,8 +382,7 @@ class WeiyuGatewayClient:
             _LOGGER.debug("Weiyu read loop ended for superseded TCP session (gen %s)", session_gen)
             return
 
-        _LOGGER.debug("Gateway EOF received, wait 5s then fast re-register (up to 3 attempts)")
-        await asyncio.sleep(5)
+        _LOGGER.debug("Gateway EOF received, immediately fast UDP re-register (up to 3 attempts)")
         for attempt in range(1, 4):
             if session_gen != self._io_generation:
                 _LOGGER.debug("EOF fast re-register closed by new TCP session (gen switched)")
@@ -414,11 +391,11 @@ class WeiyuGatewayClient:
                 await self._register_service_ip()
                 self._skip_next_post_connect_scan = True
                 self.set_gateway_activity("等待回连")
-                _LOGGER.debug("EOF fast re-register attempt %s succeeded", attempt)
+                _LOGGER.debug("EOF fast UDP re-register attempt %s succeeded", attempt)
                 return
             except Exception as exc:
-                _LOGGER.debug("EOF fast re-register attempt %s failed: %s", attempt, exc)
-                await asyncio.sleep(1.0)
+                _LOGGER.debug("EOF fast UDP re-register attempt %s failed: %s", attempt, exc)
+                await asyncio.sleep(0.4 * attempt)
 
         connected_for = None
         if self._connected_since_monotonic is not None:
@@ -717,22 +694,6 @@ class WeiyuGatewayClient:
                 await asyncio.sleep(5)
                 connected = int(self.gateway_info.get("connected", 0) or 0)
                 if connected == 1:
-                    # Pre-switch registration near expected gateway session cutoff (~186s observed).
-                    # Goal: let gateway establish a fresh TCP session before hard EOF.
-                    connected_for = (
-                        monotonic() - self._connected_since_monotonic
-                        if self._connected_since_monotonic is not None
-                        else 0.0
-                    )
-                    if connected_for > 165 and monotonic() - self._last_pre_switch_register_monotonic > 90:
-                        try:
-                            await self._register_service_ip()
-                            self._last_pre_switch_register_monotonic = monotonic()
-                            self._skip_next_post_connect_scan = True
-                            _LOGGER.debug("Pre-switch service registration refresh: ok")
-                        except Exception as exc:
-                            _LOGGER.debug("Pre-switch service registration refresh failed: %s", exc)
-
                     # Some gateway firmwares appear to expire service registration around ~190s.
                     # Refresh registration before expiry to reduce periodic forced disconnects.
                     if monotonic() - self._last_register_ok_monotonic > 120:

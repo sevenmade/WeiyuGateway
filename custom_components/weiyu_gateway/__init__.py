@@ -33,7 +33,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await client.async_start()
     except OSError as exc:
         raise ConfigEntryNotReady(
-            f"无法连接网关 {entry.data[CONF_GATEWAY_HOST]}:50500 或监听端口不可用: {exc}"
+            f"无法通过UDP向网关 {entry.data[CONF_GATEWAY_HOST]}:50500 注册或监听端口不可用: {exc}"
         ) from exc
     except Exception as exc:
         _LOGGER.exception("Failed to start Weiyu client")
