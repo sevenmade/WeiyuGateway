@@ -265,7 +265,7 @@ class WeiyuGatewayClient:
         except Exception:
             raise
 
-    async def _register_service_ip(self, udp_timeout_s: float = 5.0, max_attempts: int = 3) -> None:
+    async def _register_service_ip(self, udp_timeout_s: float = 5.0) -> None:
         """Register HA service address to gateway via UDP 50500 only."""
         register_payload = (
             json.dumps(
@@ -282,7 +282,7 @@ class WeiyuGatewayClient:
 
         udp_last_exc: Exception | None = None
         udp_last_text = ""
-        for attempt in range(1, max(1, int(max_attempts)) + 1):
+        for attempt in range(1, 4):
             try:
                 udp_text = await asyncio.to_thread(self._register_service_ip_udp, payload_bytes, udp_timeout_s)
                 udp_last_text = udp_text
@@ -382,21 +382,21 @@ class WeiyuGatewayClient:
             _LOGGER.debug("Weiyu read loop ended for superseded TCP session (gen %s)", session_gen)
             return
 
-        _LOGGER.debug("Gateway EOF received, immediately fast UDP re-register (up to 8 attempts)")
-        for attempt in range(1, 9):
+        _LOGGER.debug("Gateway EOF received, immediately fast UDP re-register (up to 3 attempts)")
+        for attempt in range(1, 4):
             if session_gen != self._io_generation:
                 _LOGGER.debug("EOF fast re-register closed by new TCP session (gen switched)")
                 return
             try:
-                # EOF path uses single-shot short-timeout retries to avoid stacked wait.
-                await self._register_service_ip(udp_timeout_s=1.2, max_attempts=1)
+                # EOF path uses short-timeout retry to minimize reconnect blackout window.
+                await self._register_service_ip(udp_timeout_s=1.8)
                 self._skip_next_post_connect_scan = True
-                self.set_gateway_activity("运行中")
+                self.set_gateway_activity("等待回连")
                 _LOGGER.debug("EOF fast UDP re-register attempt %s succeeded", attempt)
                 return
             except Exception as exc:
                 _LOGGER.debug("EOF fast UDP re-register attempt %s failed: %s", attempt, exc)
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.25 * attempt)
 
         connected_for = None
         if self._connected_since_monotonic is not None:
