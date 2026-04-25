@@ -53,6 +53,7 @@ class WeiyuGatewayClient:
         self._read_task: asyncio.Task | None = None
         self._poll_task: asyncio.Task | None = None
         self._register_task: asyncio.Task | None = None
+        self._link_probe_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
         self._re_register_lock = asyncio.Lock()
         self._io_generation: int = 0
@@ -71,6 +72,7 @@ class WeiyuGatewayClient:
         self._pending_subdev_requests: deque[float] = deque(maxlen=256)
         self._gateway_activity_text: str = "未连接"
         self._last_gateway_payload_monotonic: float = monotonic()
+        self._connected_since_monotonic: float | None = None
 
     def set_gateway_activity(self, text: str) -> None:
         """Human-readable gateway task state for UI (not used for heartbeat send/recv text)."""
@@ -104,6 +106,9 @@ class WeiyuGatewayClient:
         if self._register_task and not self._register_task.done():
             self._register_task.cancel()
         self._register_task = self.hass.async_create_task(self._register_keepalive_loop())
+        if self._link_probe_task and not self._link_probe_task.done():
+            self._link_probe_task.cancel()
+        self._link_probe_task = self.hass.async_create_task(self._link_probe_loop())
 
     async def async_stop(self) -> None:
         """Stop the client cleanly."""
@@ -114,6 +119,8 @@ class WeiyuGatewayClient:
             self._poll_task.cancel()
         if self._register_task:
             self._register_task.cancel()
+        if self._link_probe_task:
+            self._link_probe_task.cancel()
         if self._gateway_writer:
             self._gateway_writer.close()
             try:
@@ -344,6 +351,7 @@ class WeiyuGatewayClient:
             self._gateway_writer = writer
             self.gateway_info["connected"] = 1
             self._last_gateway_payload_monotonic = monotonic()
+            self._connected_since_monotonic = monotonic()
 
         _LOGGER.info("Weiyu gateway connected from %s", writer.get_extra_info("peername"))
         self.set_gateway_activity("已连接")
@@ -383,8 +391,15 @@ class WeiyuGatewayClient:
             _LOGGER.debug("Weiyu read loop ended for superseded TCP session (gen %s)", session_gen)
             return
 
-        _LOGGER.warning("Gateway disconnected")
+        connected_for = None
+        if self._connected_since_monotonic is not None:
+            connected_for = monotonic() - self._connected_since_monotonic
+        if connected_for is None:
+            _LOGGER.warning("Gateway disconnected")
+        else:
+            _LOGGER.warning("Gateway disconnected (session lasted %.1fs)", connected_for)
         self.gateway_info["connected"] = 0
+        self._connected_since_monotonic = None
         self.set_gateway_activity("已断开")
         self._gateway_writer = None
         self._gateway_reader = None
@@ -622,6 +637,7 @@ class WeiyuGatewayClient:
         _LOGGER.debug("Send failed due to connection issue: %s", exc)
         self._io_generation += 1
         self.gateway_info["connected"] = 0
+        self._connected_since_monotonic = None
         self.set_gateway_activity("恢复中")
         writer = self._gateway_writer
         self._gateway_writer = None
@@ -692,6 +708,7 @@ class WeiyuGatewayClient:
                             except Exception:
                                 pass
                         self.gateway_info["connected"] = 0
+                        self._connected_since_monotonic = None
                         self.set_gateway_activity("超时重连")
                         writer = self._gateway_writer
                         self._gateway_writer = None
@@ -712,6 +729,25 @@ class WeiyuGatewayClient:
                 return
             except Exception as exc:
                 _LOGGER.debug("Register keepalive loop error: %s", exc)
+
+    async def _link_probe_loop(self) -> None:
+        """Low-frequency probe to keep gateway session active across flaky LAN/NAT."""
+        while True:
+            try:
+                await asyncio.sleep(50)
+                if int(self.gateway_info.get("connected", 0) or 0) != 1:
+                    continue
+                if self._gateway_writer is None:
+                    continue
+                # Keep this very light and compatible with existing flow.
+                await self._async_send_packet({"actionType": "report", "actionTarget": "subver"})
+            except asyncio.CancelledError:
+                return
+            except HomeAssistantError:
+                # _async_send_packet already transitions state/re-registers on link errors.
+                continue
+            except Exception as exc:
+                _LOGGER.debug("Link probe loop error: %s", exc)
 
     async def _post_connect_scan_subdevices(self) -> None:
         """Send ``report/subdev`` repeatedly until device count stabilizes (multi-packet discovery)."""
