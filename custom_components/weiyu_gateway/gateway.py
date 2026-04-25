@@ -54,6 +54,8 @@ class WeiyuGatewayClient:
         self._poll_task: asyncio.Task | None = None
         self._register_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
+        self._re_register_lock = asyncio.Lock()
+        self._io_generation: int = 0
 
         self.devices: dict[str, dict] = {}
         self._listeners: list[Callable[[set[str]], None]] = []
@@ -69,6 +71,7 @@ class WeiyuGatewayClient:
         self._pending_subdev_requests: deque[float] = deque(maxlen=256)
         self._gateway_activity_text: str = "未连接"
         self._last_gateway_payload_monotonic: float = monotonic()
+
     def set_gateway_activity(self, text: str) -> None:
         """Human-readable gateway task state for UI (not used for heartbeat send/recv text)."""
         if self._gateway_activity_text == text:
@@ -320,6 +323,17 @@ class WeiyuGatewayClient:
     async def _handle_gateway_connected(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         """Handle reverse TCP connection from gateway."""
         async with self._lock:
+            self._io_generation += 1
+            session_gen = self._io_generation
+            if self._read_task and not self._read_task.done():
+                self._read_task.cancel()
+                try:
+                    await self._read_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                self._read_task = None
             if self._gateway_writer:
                 self._gateway_writer.close()
                 try:
@@ -341,30 +355,43 @@ class WeiyuGatewayClient:
             self._poll_task.cancel()
         self._poll_task = None
         # Reader must run before post-connect scan so subdev/subclass replies are not missed.
-        self._read_task = self.hass.async_create_task(self._read_loop())
+        self._read_task = self.hass.async_create_task(self._read_loop(session_gen))
         self.hass.async_create_task(self._sync_gateway_time_after_connect())
         self.hass.async_create_task(self._post_connect_scan_subdevices())
 
-    async def _read_loop(self) -> None:
+    async def _read_loop(self, session_gen: int) -> None:
         """Read and parse framed protocol packets."""
-        if self._gateway_reader is None:
+        reader = self._gateway_reader
+        if reader is None:
             return
 
         buffer = bytearray()
-        while True:
-            chunk = await self._gateway_reader.read(4096)
-            if not chunk:
-                _LOGGER.warning("Gateway disconnected")
-                self.gateway_info["connected"] = 0
-                self.set_gateway_activity("已断开")
-                self._gateway_writer = None
-                self._gateway_reader = None
-                self._notify_listeners(set())
-                self.hass.async_create_task(self._try_re_register())
-                return
-            buffer.extend(chunk)
-            for payload in self._extract_packets(buffer):
-                await self._handle_payload(payload)
+        try:
+            while True:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    break
+                buffer.extend(chunk)
+                for payload in self._extract_packets(buffer):
+                    await self._handle_payload(payload)
+        except asyncio.CancelledError:
+            return
+        finally:
+            pass
+
+        if session_gen != self._io_generation:
+            _LOGGER.debug("Weiyu read loop ended for superseded TCP session (gen %s)", session_gen)
+            return
+
+        _LOGGER.warning("Gateway disconnected")
+        self.gateway_info["connected"] = 0
+        self.set_gateway_activity("已断开")
+        self._gateway_writer = None
+        self._gateway_reader = None
+        self._notify_listeners(set())
+        if session_gen != self._io_generation:
+            return
+        self.hass.async_create_task(self._try_re_register())
 
     def _extract_packets(self, buffer: bytearray) -> list[dict]:
         """Extract as many valid packets as possible from stream buffer."""
@@ -593,6 +620,7 @@ class WeiyuGatewayClient:
     async def _handle_send_connection_error(self, exc: Exception) -> None:
         """Handle connection-lost errors during command sending."""
         _LOGGER.debug("Send failed due to connection issue: %s", exc)
+        self._io_generation += 1
         self.gateway_info["connected"] = 0
         self.set_gateway_activity("恢复中")
         writer = self._gateway_writer
@@ -626,12 +654,15 @@ class WeiyuGatewayClient:
 
     async def _try_re_register(self) -> None:
         """Best-effort re-register service endpoint after disconnect."""
-        self.set_gateway_activity("重连中")
-        try:
-            await self._register_service_ip()
-            self.set_gateway_activity("待连接")
-        except Exception as exc:
-            _LOGGER.debug("Re-register service endpoint failed: %s", exc)
+        async with self._re_register_lock:
+            if int(self.gateway_info.get("connected", 0) or 0) == 1 and self._gateway_writer is not None:
+                return
+            self.set_gateway_activity("重连中")
+            try:
+                await self._register_service_ip()
+                self.set_gateway_activity("待连接")
+            except Exception as exc:
+                _LOGGER.debug("Re-register service endpoint failed: %s", exc)
 
     async def _register_keepalive_loop(self) -> None:
         """Periodically ensure gateway keeps service endpoint registration."""
@@ -640,7 +671,8 @@ class WeiyuGatewayClient:
                 await asyncio.sleep(60)
                 connected = int(self.gateway_info.get("connected", 0) or 0)
                 if connected == 1:
-                    timeout_s = max(90, int(self._target_report_cycle_seconds) * 2 + 30)
+                    # Margin above gateway report cycle; heartbeats normally keep this fresh.
+                    timeout_s = max(180, int(self._target_report_cycle_seconds) * 3 + 90)
                     silent_s = monotonic() - self._last_gateway_payload_monotonic
                     if silent_s > timeout_s:
                         _LOGGER.warning(
@@ -648,6 +680,17 @@ class WeiyuGatewayClient:
                             silent_s,
                             timeout_s,
                         )
+                        self._io_generation += 1
+                        read_task = self._read_task
+                        self._read_task = None
+                        if read_task and not read_task.done():
+                            read_task.cancel()
+                            try:
+                                await read_task
+                            except asyncio.CancelledError:
+                                pass
+                            except Exception:
+                                pass
                         self.gateway_info["connected"] = 0
                         self.set_gateway_activity("超时重连")
                         writer = self._gateway_writer
