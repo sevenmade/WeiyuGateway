@@ -382,6 +382,12 @@ class WeiyuGatewayClient:
             _LOGGER.debug("Weiyu read loop ended for superseded TCP session (gen %s)", session_gen)
             return
 
+        # Per user requirement: mark offline immediately on EOF.
+        self.gateway_info["connected"] = 0
+        self._connected_since_monotonic = None
+        self.set_gateway_activity("已断开")
+        self._notify_listeners(set())
+
         _LOGGER.debug("Gateway EOF received, immediately fast UDP re-register (up to 3 attempts)")
         for attempt in range(1, 4):
             if session_gen != self._io_generation:
