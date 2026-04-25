@@ -24,8 +24,6 @@ _MAX_FRAME_PAYLOAD_BYTES = 256 * 1024
 # If no 0xFA appears, retain tail to survive chunk splits and avoid unbounded growth.
 _MAX_BUFFER_NO_SYNC = 65536
 _BUFFER_TRIM_KEEP = 8192
-# Temporary test switch: focus only on heartbeat processing.
-_HEARTBEAT_ONLY_TEST_MODE = True
 
 
 class WeiyuGatewayClient:
@@ -78,8 +76,6 @@ class WeiyuGatewayClient:
         self._last_register_ok_monotonic: float = 0.0
         self._last_heartbeat_monotonic: float = monotonic()
         self._skip_next_post_connect_scan: bool = False
-        self._heartbeat_only_seen_version: bool = False
-        self._heartbeat_only_lock_non_heartbeat: bool = False
 
     def set_gateway_activity(self, text: str) -> None:
         """Human-readable gateway task state for UI (not used for heartbeat send/recv text)."""
@@ -342,7 +338,6 @@ class WeiyuGatewayClient:
             self._last_gateway_payload_monotonic = monotonic()
             self._connected_since_monotonic = monotonic()
             self._last_heartbeat_monotonic = monotonic()
-            self._heartbeat_only_lock_non_heartbeat = False
 
         _LOGGER.info("Weiyu gateway connected from %s", writer.get_extra_info("peername"))
         self.set_gateway_activity("已连接")
@@ -387,7 +382,6 @@ class WeiyuGatewayClient:
             _LOGGER.debug("Weiyu read loop ended for superseded TCP session (gen %s)", session_gen)
             return
 
-        self._notify_eof_event()
         _LOGGER.debug("Gateway EOF received, immediately fast UDP re-register (up to 3 attempts)")
         for attempt in range(1, 4):
             if session_gen != self._io_generation:
@@ -420,31 +414,6 @@ class WeiyuGatewayClient:
         if session_gen != self._io_generation:
             return
         self.hass.async_create_task(self._try_re_register())
-
-    def _notify_eof_event(self) -> None:
-        """Create a persistent notification whenever EOF is observed."""
-        connected_for = (
-            monotonic() - self._connected_since_monotonic
-            if self._connected_since_monotonic is not None
-            else None
-        )
-        duration_text = "-" if connected_for is None else f"{connected_for:.1f}s"
-        self.hass.async_create_task(
-            self.hass.services.async_call(
-                "persistent_notification",
-                "create",
-                {
-                    "title": "Weiyu EOF 监测通知",
-                    "message": (
-                        "检测到网关 TCP EOF（用于心跳专项测试）。\n\n"
-                        f"会话时长: {duration_text}\n"
-                        "说明: 当前版本处于心跳优先测试模式，非心跳数据会被忽略。"
-                    ),
-                    "notification_id": "weiyu_gateway_eof_watch",
-                },
-                blocking=False,
-            )
-        )
 
     def _extract_packets(self, buffer: bytearray) -> list[dict]:
         """Extract as many valid packets as possible from stream buffer."""
@@ -538,18 +507,7 @@ class WeiyuGatewayClient:
         if isinstance(action_type, str):
             action_type = action_type.lower()
 
-        if _HEARTBEAT_ONLY_TEST_MODE and self._heartbeat_only_lock_non_heartbeat:
-            if payload:
-                _LOGGER.debug(
-                    "Heartbeat-only test mode: ignore non-heartbeat payload actionType=%s keys=%s",
-                    action_type,
-                    sorted(payload.keys()),
-                )
-            return
-
         if action_type == "version" and "data" in payload:
-            if _HEARTBEAT_ONLY_TEST_MODE:
-                self._heartbeat_only_seen_version = True
             self._update_gateway_version(payload["data"])
             return
         if action_type == "subclass" and "data" in payload:
@@ -854,9 +812,6 @@ class WeiyuGatewayClient:
             if self._gateway_writer and int(self.gateway_info.get("connected", 0) or 0):
                 self.set_gateway_activity("运行中" if self.devices else "运行中(无设备)")
                 self._notify_listeners(set())
-            if _HEARTBEAT_ONLY_TEST_MODE:
-                # After first post-connect scan, freeze non-heartbeat handling for the test.
-                self._heartbeat_only_lock_non_heartbeat = True
 
     @staticmethod
     def _build_model_name(data: dict) -> str:
