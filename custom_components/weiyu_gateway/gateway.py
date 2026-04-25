@@ -73,6 +73,8 @@ class WeiyuGatewayClient:
         self._gateway_activity_text: str = "未连接"
         self._last_gateway_payload_monotonic: float = monotonic()
         self._connected_since_monotonic: float | None = None
+        self._last_register_ok_monotonic: float = 0.0
+        self._last_heartbeat_monotonic: float = monotonic()
 
     def set_gateway_activity(self, text: str) -> None:
         """Human-readable gateway task state for UI (not used for heartbeat send/recv text)."""
@@ -290,6 +292,7 @@ class WeiyuGatewayClient:
             _LOGGER.debug("Weiyu register TCP response: %s", text)
             if "Set OK" not in text:
                 raise RuntimeError(f"Unexpected TCP register response: {text or '<empty>'}")
+            self._last_register_ok_monotonic = monotonic()
             return
         except Exception as exc:
             tcp_exc = exc
@@ -303,6 +306,7 @@ class WeiyuGatewayClient:
                 udp_last_text = udp_text
                 _LOGGER.debug("Weiyu register UDP response (attempt %s): %s", attempt, udp_text)
                 if "Set OK" in udp_text:
+                    self._last_register_ok_monotonic = monotonic()
                     return
                 await asyncio.sleep(0.35 * attempt)
             except Exception as exc:
@@ -352,6 +356,7 @@ class WeiyuGatewayClient:
             self.gateway_info["connected"] = 1
             self._last_gateway_payload_monotonic = monotonic()
             self._connected_since_monotonic = monotonic()
+            self._last_heartbeat_monotonic = monotonic()
 
         _LOGGER.info("Weiyu gateway connected from %s", writer.get_extra_info("peername"))
         self.set_gateway_activity("已连接")
@@ -481,6 +486,7 @@ class WeiyuGatewayClient:
 
         hb_key, hb_val = self._find_heartbeat_pair(payload)
         if hb_key is not None:
+            self._last_heartbeat_monotonic = monotonic()
             if isinstance(hb_val, str) and hb_val.strip():
                 if not self.gateway_info.get("model") or self.gateway_info.get("model") == "Unknown":
                     self.gateway_info["model"] = hb_val.strip()
@@ -684,10 +690,55 @@ class WeiyuGatewayClient:
         """Periodically ensure gateway keeps service endpoint registration."""
         while True:
             try:
-                await asyncio.sleep(60)
+                await asyncio.sleep(5)
                 connected = int(self.gateway_info.get("connected", 0) or 0)
                 if connected == 1:
-                    # Margin above gateway report cycle; heartbeats normally keep this fresh.
+                    # Some gateway firmwares appear to expire service registration around ~190s.
+                    # Refresh registration before expiry to reduce periodic forced disconnects.
+                    if monotonic() - self._last_register_ok_monotonic > 120:
+                        try:
+                            await self._register_service_ip()
+                            _LOGGER.debug("Periodic service registration refresh: ok")
+                        except Exception as exc:
+                            _LOGGER.debug("Periodic service registration refresh failed: %s", exc)
+
+                    # Heartbeat-first liveness: mark offline if no heartbeat >15s.
+                    timeout_s = 15
+                    silent_hb_s = monotonic() - self._last_heartbeat_monotonic
+                    if silent_hb_s > timeout_s:
+                        _LOGGER.warning(
+                            "Gateway heartbeat silent for %.1fs (timeout=%ss), mark offline and re-register",
+                            silent_hb_s,
+                            timeout_s,
+                        )
+                        self._io_generation += 1
+                        read_task = self._read_task
+                        self._read_task = None
+                        if read_task and not read_task.done():
+                            read_task.cancel()
+                            try:
+                                await read_task
+                            except asyncio.CancelledError:
+                                pass
+                            except Exception:
+                                pass
+                        self.gateway_info["connected"] = 0
+                        self._connected_since_monotonic = None
+                        self.set_gateway_activity("心跳超时重连")
+                        writer = self._gateway_writer
+                        self._gateway_writer = None
+                        self._gateway_reader = None
+                        if writer:
+                            writer.close()
+                            try:
+                                await writer.wait_closed()
+                            except (BrokenPipeError, ConnectionResetError, OSError):
+                                pass
+                        self._notify_listeners(set())
+                        await self._try_re_register()
+                        continue
+
+                    # Fallback payload-silence guard.
                     timeout_s = max(180, int(self._target_report_cycle_seconds) * 3 + 90)
                     silent_s = monotonic() - self._last_gateway_payload_monotonic
                     if silent_s > timeout_s:
